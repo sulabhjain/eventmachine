@@ -1541,28 +1541,35 @@ name2address
 
 bool EventMachine_t::name2address (const char *server, int port, struct sockaddr *addr, size_t *addr_len)
 {
-	if (!server || !*server)
-		server = "0.0.0.0";
+        if (!server || !*server)
+                server = "0.0.0.0";
 
-	struct addrinfo *ai;
-	struct addrinfo hints;
-	memset (&hints, 0, sizeof(hints));
-	hints.ai_family = AF_UNSPEC;
-	hints.ai_flags = AI_NUMERICSERV | AI_ADDRCONFIG;
+        struct addrinfo *ai;
+        struct addrinfo hints;
+        unsigned char buf[sizeof(struct in6_addr)];
 
-	char portstr[12];
-	snprintf(portstr, sizeof(portstr), "%u", port);
+        memset (&hints, 0, sizeof(hints));
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_flags = AI_NUMERICSERV;
 
-	if (getaddrinfo (server, portstr, &hints, &ai) == 0) {
-		assert (ai->ai_addrlen <= *addr_len);
-		memcpy (addr, ai->ai_addr, ai->ai_addrlen);
-		*addr_len = ai->ai_addrlen;
+        char portstr[12];
+        snprintf(portstr, sizeof(portstr), "%u", port);
 
-		freeaddrinfo(ai);
-		return true;
-	}
+        int s = inet_pton(AF_INET, server, buf);
+        cout << "value of s:" << server;
+        if (s!=1) {
+            hints.ai_flags |= AI_ADDRCONFIG;
+        }
+        if (getaddrinfo (server, portstr, &hints, &ai) == 0) {
+                assert (ai->ai_addrlen <= *addr_len);
+                memcpy (addr, ai->ai_addr, ai->ai_addrlen);
+                *addr_len = ai->ai_addrlen;
 
-	return false;
+                freeaddrinfo(ai);
+                return true;
+        }
+
+        return false;
 }
 
 

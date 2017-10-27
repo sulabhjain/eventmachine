@@ -1555,7 +1555,12 @@ bool EventMachine_t::name2address (const char *server, int port, struct sockaddr
         char portstr[12];
         snprintf(portstr, sizeof(portstr), "%u", port);
 
-        int s = inet_pton(AF_INET, server, buf);
+        int family = AF_INET;
+        if(strchr(server, ':') != NULL) {
+          family = AF_INET6;
+        }
+
+        int s = inet_pton(family, server, buf);
         if (s!=1) {
             hints.ai_flags |= AI_ADDRCONFIG;
         }

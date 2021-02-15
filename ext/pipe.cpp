@@ -30,8 +30,6 @@ PipeDescriptor::PipeDescriptor
 PipeDescriptor::PipeDescriptor (int fd, pid_t subpid, EventMachine_t *parent_em):
 	EventableDescriptor (fd, parent_em),
 	bReadAttemptedAfterClose (false),
-	LastIo (gCurrentLoopTime),
-	InactivityTimeout (0),
 	OutboundDataSize (0),
 	SubprocessPid (subpid)
 {
@@ -92,16 +90,40 @@ PipeDescriptor::~PipeDescriptor()
 	 * within other unbind calls. (Not sure if that's even possible.)
 	 */
 
-	struct timespec req = {0, 10000000};
-	kill (SubprocessPid, SIGTERM);
-	nanosleep (&req, NULL);
 	assert (MyEventMachine);
-	if (waitpid (SubprocessPid, &(MyEventMachine->SubprocessExitStatus), WNOHANG) == 0) {
-		kill (SubprocessPid, SIGKILL);
+
+	/* Another hack to make the SubprocessPid available to get_subprocess_status */
+	MyEventMachine->SubprocessPid = SubprocessPid;
+
+	/* 01Mar09: Updated to use a small nanosleep in a loop. When nanosleep is interrupted by SIGCHLD,
+	 * it resumes the system call after processing the signal (resulting in unnecessary latency).
+	 * Calling nanosleep in a loop avoids this problem.
+	 */
+	struct timespec req = {0, 50000000}; // 0.05s
+	int n;
+
+	// wait 0.5s for the process to die
+	for (n=0; n<10; n++) {
+		if (waitpid (SubprocessPid, &(MyEventMachine->SubprocessExitStatus), WNOHANG) != 0) return;
 		nanosleep (&req, NULL);
-		if (waitpid (SubprocessPid, &(MyEventMachine->SubprocessExitStatus), WNOHANG) == 0)
-			throw std::runtime_error ("unable to reap subprocess");
 	}
+
+	// send SIGTERM and wait another 1s
+	kill (SubprocessPid, SIGTERM);
+	for (n=0; n<20; n++) {
+		nanosleep (&req, NULL);
+		if (waitpid (SubprocessPid, &(MyEventMachine->SubprocessExitStatus), WNOHANG) != 0) return;
+	}
+
+	// send SIGKILL and wait another 5s
+	kill (SubprocessPid, SIGKILL);
+	for (n=0; n<100; n++) {
+		nanosleep (&req, NULL);
+		if (waitpid (SubprocessPid, &(MyEventMachine->SubprocessExitStatus), WNOHANG) != 0) return;
+	}
+
+	// still not dead, give up!
+	throw std::runtime_error ("unable to reap subprocess");
 }
 
 
@@ -119,7 +141,7 @@ void PipeDescriptor::Read()
 		return;
 	}
 
-	LastIo = gCurrentLoopTime;
+	LastActivity = MyEventMachine->GetCurrentLoopTime();
 
 	int total_bytes_read = 0;
 	char readbuffer [16 * 1024];
@@ -140,7 +162,6 @@ void PipeDescriptor::Read()
 
 		if (r > 0) {
 			total_bytes_read += r;
-			LastRead = gCurrentLoopTime;
 
 			// Add a null-terminator at the the end of the buffer
 			// that we will send to the callback.
@@ -149,8 +170,7 @@ void PipeDescriptor::Read()
 			// the option to do some things faster. Additionally it's
 			// a security guard against buffer overflows.
 			readbuffer [r] = 0;
-			if (EventCallback)
-				(*EventCallback)(GetBinding().c_str(), EM_CONNECTION_READ, readbuffer, r);
+			_GenericInboundDispatch(readbuffer, r);
 			}
 		else if (r == 0) {
 			break;
@@ -181,7 +201,7 @@ void PipeDescriptor::Write()
 	int sd = GetSocket();
 	assert (sd != INVALID_SOCKET);
 
-	LastIo = gCurrentLoopTime;
+	LastActivity = MyEventMachine->GetCurrentLoopTime();
 	char output_buffer [16 * 1024];
 	size_t nbytes = 0;
 
@@ -209,6 +229,11 @@ void PipeDescriptor::Write()
 
 	assert (GetSocket() != INVALID_SOCKET);
 	int bytes_written = write (GetSocket(), output_buffer, nbytes);
+#ifdef OS_WIN32
+	int e = WSAGetLastError();
+#else
+	int e = errno;
+#endif
 
 	if (bytes_written > 0) {
 		OutboundDataSize -= bytes_written;
@@ -222,17 +247,19 @@ void PipeDescriptor::Write()
 			OutboundPages.push_front (OutboundPage (buffer, len));
 		}
 		#ifdef HAVE_EPOLL
-		EpollEvent.events = (EPOLLIN | (SelectForWrite() ? EPOLLOUT : 0));
+		EpollEvent.events = EPOLLIN;
+		if (SelectForWrite())
+			EpollEvent.events |= EPOLLOUT;
 		assert (MyEventMachine);
 		MyEventMachine->Modify (this);
 		#endif
 	}
 	else {
 		#ifdef OS_UNIX
-		if ((errno != EINPROGRESS) && (errno != EWOULDBLOCK) && (errno != EINTR))
+		if ((e != EINPROGRESS) && (e != EWOULDBLOCK) && (e != EINTR))
 		#endif
 		#ifdef OS_WIN32
-		if ((errno != WSAEINPROGRESS) && (errno != WSAEWOULDBLOCK))
+		if ((e != WSAEINPROGRESS) && (e != WSAEWOULDBLOCK))
 		#endif
 			Close();
 	}
@@ -246,7 +273,7 @@ PipeDescriptor::Heartbeat
 void PipeDescriptor::Heartbeat()
 {
 	// If an inactivity timeout is defined, then check for it.
-	if (InactivityTimeout && ((gCurrentLoopTime - LastIo) >= InactivityTimeout))
+	if (InactivityTimeout && ((MyEventMachine->GetCurrentLoopTime() - LastActivity) >= InactivityTimeout))
 		ScheduleClose (false);
 		//bCloseNow = true;
 }
@@ -262,7 +289,7 @@ bool PipeDescriptor::SelectForRead()
 	 * a pending state, so this is simpler than for the
 	 * ConnectionDescriptor object.
 	 */
-	return true;
+	return bPaused ? false : true;
 }
 
 /******************************
@@ -275,7 +302,7 @@ bool PipeDescriptor::SelectForWrite()
 	 * a pending state, so this is simpler than for the
 	 * ConnectionDescriptor object.
 	 */
-	return (GetOutboundDataSize() > 0);
+	return (GetOutboundDataSize() > 0) && !bPaused ? true : false;
 }
 
 
@@ -285,7 +312,7 @@ bool PipeDescriptor::SelectForWrite()
 PipeDescriptor::SendOutboundData
 ********************************/
 
-int PipeDescriptor::SendOutboundData (const char *data, int length)
+int PipeDescriptor::SendOutboundData (const char *data, unsigned long length)
 {
 	//if (bCloseNow || bCloseAfterWriting)
 	if (IsCloseScheduled())

@@ -27,7 +27,7 @@ class SslBox_t; // forward reference
 #endif
 
 bool SetSocketNonblocking (SOCKET);
-
+bool SetFdCloexec (int);
 
 /*************************
 class EventableDescriptor
@@ -36,10 +36,10 @@ class EventableDescriptor
 class EventableDescriptor: public Bindable_t
 {
 	public:
-		EventableDescriptor (int, EventMachine_t*);
+		EventableDescriptor (SOCKET, EventMachine_t*);
 		virtual ~EventableDescriptor();
 
-		int GetSocket() {return MySocket;}
+		SOCKET GetSocket() {return MySocket;}
 		void SetSocketInvalid() { MySocket = INVALID_SOCKET; }
 		void Close();
 
@@ -56,50 +56,94 @@ class EventableDescriptor: public Bindable_t
 		bool ShouldDelete();
 		// Do we have any data to write? This is used by ShouldDelete.
 		virtual int GetOutboundDataSize() {return 0;}
+		virtual bool IsWatchOnly(){ return bWatchOnly; }
 
-		void ScheduleClose (bool after_writing);
+		virtual void ScheduleClose (bool after_writing);
 		bool IsCloseScheduled();
+		virtual void HandleError(){ ScheduleClose (false); }
 
-		void SetEventCallback (void (*cb)(const char*, int, const char*, int));
+		void SetEventCallback (EMCallback);
 
-		virtual bool GetPeername (struct sockaddr*) {return false;}
-		virtual bool GetSockname (struct sockaddr*) {return false;}
+		virtual bool GetPeername (struct sockaddr*, socklen_t*) {return false;}
+		virtual bool GetSockname (struct sockaddr*, socklen_t*) {return false;}
 		virtual bool GetSubprocessPid (pid_t*) {return false;}
 
 		virtual void StartTls() {}
-		virtual void SetTlsParms (const char *privkey_filename, const char *certchain_filename) {}
+		virtual void SetTlsParms (const char *, const char *, bool, bool, const char *, const char *, const char *, const char *, int) {}
 
-		// Properties: return 0/1 to signify T/F, and handle the values
-		// through arguments.
-		virtual int GetCommInactivityTimeout (int *value) {return 0;}
-		virtual int SetCommInactivityTimeout (int *value) {return 0;}
+		#ifdef WITH_SSL
+		virtual X509 *GetPeerCert() {return NULL;}
+		virtual int GetCipherBits() {return -1;}
+		virtual const char *GetCipherName() {return NULL;}
+		virtual const char *GetCipherProtocol() {return NULL;}
+		virtual const char *GetSNIHostname() {return NULL;}
+		#endif
+
+		virtual uint64_t GetCommInactivityTimeout() {return 0;}
+		virtual int SetCommInactivityTimeout (uint64_t) {return 0;}
+		uint64_t GetPendingConnectTimeout();
+		int SetPendingConnectTimeout (uint64_t value);
+		uint64_t GetLastActivity() { return LastActivity; }
 
 		#ifdef HAVE_EPOLL
 		struct epoll_event *GetEpollEvent() { return &EpollEvent; }
 		#endif
 
+		#ifdef HAVE_KQUEUE
+		bool GetKqueueArmWrite() { return bKqueueArmWrite; }
+		#endif
+
+		virtual void StartProxy(const uintptr_t, const unsigned long, const unsigned long);
+		virtual void StopProxy();
+		virtual unsigned long GetProxiedBytes(){ return ProxiedBytes; };
+		virtual void SetProxiedFrom(EventableDescriptor*, const unsigned long);
+		virtual int SendOutboundData(const char*,unsigned long){ return -1; }
+		virtual bool IsPaused(){ return bPaused; }
+		virtual bool Pause(){ bPaused = true; return bPaused; }
+		virtual bool Resume(){ bPaused = false; return bPaused; }
+
+		void SetUnbindReasonCode(int code){ UnbindReasonCode = code; }
+		virtual int ReportErrorStatus(){ return 0; }
+		virtual bool IsConnectPending(){ return false; }
+		virtual uint64_t GetNextHeartbeat();
+
 	private:
 		bool bCloseNow;
 		bool bCloseAfterWriting;
-		int MySocket;
 
 	protected:
-		enum {
-			PendingConnectTimeout = 4 // can easily be made an instance variable
-		};
+		SOCKET MySocket;
+		bool bAttached;
+		bool bWatchOnly;
 
-		void (*EventCallback)(const char*, int, const char*, int);
-    
-		time_t CreatedAt;
-		time_t LastRead;
-		time_t LastWritten;
+		EMCallback EventCallback;
+		void _GenericInboundDispatch(const char *buffer, unsigned long size);
+
+		uint64_t CreatedAt;
 		bool bCallbackUnbind;
+		int UnbindReasonCode;
+
+		unsigned long BytesToProxy;
+		EventableDescriptor *ProxyTarget;
+		EventableDescriptor *ProxiedFrom;
+		unsigned long ProxiedBytes;
+
+		unsigned long MaxOutboundBufSize;
 
 		#ifdef HAVE_EPOLL
 		struct epoll_event EpollEvent;
 		#endif
 
+		#ifdef HAVE_KQUEUE
+		bool bKqueueArmWrite;
+		#endif
+
 		EventMachine_t *MyEventMachine;
+		uint64_t PendingConnectTimeout;
+		uint64_t InactivityTimeout;
+		uint64_t LastActivity;
+		uint64_t NextHeartbeat;
+		bool bPaused;
 };
 
 
@@ -111,7 +155,7 @@ class LoopbreakDescriptor
 class LoopbreakDescriptor: public EventableDescriptor
 {
 	public:
-		LoopbreakDescriptor (int, EventMachine_t*);
+		LoopbreakDescriptor (SOCKET, EventMachine_t*);
 		virtual ~LoopbreakDescriptor() {}
 
 		virtual void Read();
@@ -130,19 +174,25 @@ class ConnectionDescriptor
 class ConnectionDescriptor: public EventableDescriptor
 {
 	public:
-		ConnectionDescriptor (int, EventMachine_t*);
+		ConnectionDescriptor (SOCKET, EventMachine_t*);
 		virtual ~ConnectionDescriptor();
 
-		static int SendDataToConnection (const char*, const char*, int);
-		static void CloseConnection (const char*, bool);
-		static int ReportErrorStatus (const char*);
+		int SendOutboundData (const char*, unsigned long);
 
-		int SendOutboundData (const char*, int);
+		void SetConnectPending (bool f);
+		virtual void ScheduleClose (bool after_writing);
+		virtual void HandleError();
 
-		void SetConnectPending (bool f) { bConnectPending = f; }
+		void SetNotifyReadable (bool);
+		void SetNotifyWritable (bool);
+		void SetAttached (bool);
+		void SetWatchOnly (bool);
 
-		void SetNotifyReadable (bool readable) { bNotifyReadable = readable; }
-		void SetNotifyWritable (bool writable) { bNotifyWritable = writable; }
+		bool Pause();
+		bool Resume();
+
+		bool IsNotifyReadable(){ return bNotifyReadable; }
+		bool IsNotifyWritable(){ return bNotifyWritable; }
 
 		virtual void Read();
 		virtual void Write();
@@ -155,20 +205,33 @@ class ConnectionDescriptor: public EventableDescriptor
 		virtual int GetOutboundDataSize() {return OutboundDataSize;}
 
 		virtual void StartTls();
-		virtual void SetTlsParms (const char *privkey_filename, const char *certchain_filename);
+		virtual void SetTlsParms (const char *, const char *, bool, bool, const char *, const char *, const char *, const char *, int);
+
+		#ifdef WITH_SSL
+		virtual X509 *GetPeerCert();
+		virtual int GetCipherBits();
+		virtual const char *GetCipherName();
+		virtual const char *GetCipherProtocol();
+		virtual const char *GetSNIHostname();
+		virtual bool VerifySslPeer(const char*);
+		virtual void AcceptSslPeer();
+		#endif
+
 		void SetServerMode() {bIsServer = true;}
 
-		virtual bool GetPeername (struct sockaddr*);
-		virtual bool GetSockname (struct sockaddr*);
+		virtual bool GetPeername (struct sockaddr*, socklen_t*);
+		virtual bool GetSockname (struct sockaddr*, socklen_t*);
 
-		virtual int GetCommInactivityTimeout (int *value);
-		virtual int SetCommInactivityTimeout (int *value);
+		virtual uint64_t GetCommInactivityTimeout();
+		virtual int SetCommInactivityTimeout (uint64_t value);
 
+		virtual int ReportErrorStatus();
+		virtual bool IsConnectPending(){ return bConnectPending; }
 
 	protected:
 		struct OutboundPage {
 			OutboundPage (const char *b, int l, int o=0): Buffer(b), Length(l), Offset(o) {}
-			void Free() {if (Buffer) free ((char*)Buffer); }
+			void Free() {if (Buffer) free (const_cast<char*>(Buffer)); }
 			const char *Buffer;
 			int Length;
 			int Offset;
@@ -190,18 +253,31 @@ class ConnectionDescriptor: public EventableDescriptor
 		SslBox_t *SslBox;
 		std::string CertChainFilename;
 		std::string PrivateKeyFilename;
+		std::string CipherList;
+		std::string EcdhCurve;
+		std::string DhParam;
+		int Protocols;
+		bool bHandshakeSignaled;
+		bool bSslVerifyPeer;
+		bool bSslFailIfNoPeerCert;
+		std::string SniHostName;
+		bool bSslPeerAccepted;
 		#endif
+
+		#ifdef HAVE_KQUEUE
+		bool bGotExtraKqueueEvent;
+		#endif
+
 		bool bIsServer;
 
-		time_t LastIo;
-		int InactivityTimeout;
-
 	private:
+		void _UpdateEvents();
+		void _UpdateEvents(bool, bool);
 		void _WriteOutboundData();
-		void _DispatchInboundData (const char *buffer, int size);
+		void _DispatchInboundData (const char *buffer, unsigned long size);
 		void _DispatchCiphertext();
-		int _SendRawOutboundData (const char*, int);
-		int _ReportErrorStatus();
+		int _SendRawOutboundData (const char *buffer, unsigned long size);
+		void _CheckHandshakeStatus();
 
 };
 
@@ -213,7 +289,7 @@ class DatagramDescriptor
 class DatagramDescriptor: public EventableDescriptor
 {
 	public:
-		DatagramDescriptor (int, EventMachine_t*);
+		DatagramDescriptor (SOCKET, EventMachine_t*);
 		virtual ~DatagramDescriptor();
 
 		virtual void Read();
@@ -223,38 +299,32 @@ class DatagramDescriptor: public EventableDescriptor
 		virtual bool SelectForRead() {return true;}
 		virtual bool SelectForWrite();
 
-		int SendOutboundData (const char*, int);
-		int SendOutboundDatagram (const char*, int, const char*, int);
+		int SendOutboundData (const char*, unsigned long);
+		int SendOutboundDatagram (const char*, unsigned long, const char*, int);
 
 		// Do we have any data to write? This is used by ShouldDelete.
 		virtual int GetOutboundDataSize() {return OutboundDataSize;}
 
-		virtual bool GetPeername (struct sockaddr*);
-		virtual bool GetSockname (struct sockaddr*);
+		virtual bool GetPeername (struct sockaddr*, socklen_t*);
+		virtual bool GetSockname (struct sockaddr*, socklen_t*);
 
-    virtual int GetCommInactivityTimeout (int *value);
-    virtual int SetCommInactivityTimeout (int *value);
-
-		static int SendDatagram (const char*, const char*, int, const char*, int);
-
+		virtual uint64_t GetCommInactivityTimeout();
+		virtual int SetCommInactivityTimeout (uint64_t value);
 
 	protected:
 		struct OutboundPage {
-			OutboundPage (const char *b, int l, struct sockaddr_in f, int o=0): Buffer(b), Length(l), Offset(o), From(f) {}
-			void Free() {if (Buffer) free ((char*)Buffer); }
+			OutboundPage (const char *b, int l, struct sockaddr_in6 f, int o=0): Buffer(b), Length(l), Offset(o), From(f) {}
+			void Free() {if (Buffer) free (const_cast<char*>(Buffer)); }
 			const char *Buffer;
 			int Length;
 			int Offset;
-			struct sockaddr_in From;
+			struct sockaddr_in6 From;
 		};
 
 		deque<OutboundPage> OutboundPages;
 		int OutboundDataSize;
 
-		struct sockaddr_in ReturnAddress;
-
-		time_t LastIo;
-		int InactivityTimeout;
+		struct sockaddr_in6 ReturnAddress;
 };
 
 
@@ -265,7 +335,7 @@ class AcceptorDescriptor
 class AcceptorDescriptor: public EventableDescriptor
 {
 	public:
-		AcceptorDescriptor (int, EventMachine_t*);
+		AcceptorDescriptor (SOCKET, EventMachine_t*);
 		virtual ~AcceptorDescriptor();
 
 		virtual void Read();
@@ -275,9 +345,9 @@ class AcceptorDescriptor: public EventableDescriptor
 		virtual bool SelectForRead() {return true;}
 		virtual bool SelectForWrite() {return false;}
 
-		virtual bool GetSockname (struct sockaddr*);
+		virtual bool GetSockname (struct sockaddr*, socklen_t*);
 
-		static void StopAcceptor (const char *binding);
+		static void StopAcceptor (const uintptr_t binding);
 };
 
 /********************
@@ -288,7 +358,7 @@ class PipeDescriptor
 class PipeDescriptor: public EventableDescriptor
 {
 	public:
-		PipeDescriptor (int, pid_t, EventMachine_t*);
+		PipeDescriptor (SOCKET, pid_t, EventMachine_t*);
 		virtual ~PipeDescriptor();
 
 		virtual void Read();
@@ -298,7 +368,7 @@ class PipeDescriptor: public EventableDescriptor
 		virtual bool SelectForRead();
 		virtual bool SelectForWrite();
 
-		int SendOutboundData (const char*, int);
+		int SendOutboundData (const char*, unsigned long);
 		virtual int GetOutboundDataSize() {return OutboundDataSize;}
 
 		virtual bool GetSubprocessPid (pid_t*);
@@ -306,7 +376,7 @@ class PipeDescriptor: public EventableDescriptor
 	protected:
 		struct OutboundPage {
 			OutboundPage (const char *b, int l, int o=0): Buffer(b), Length(l), Offset(o) {}
-			void Free() {if (Buffer) free ((char*)Buffer); }
+			void Free() {if (Buffer) free (const_cast<char*>(Buffer)); }
 			const char *Buffer;
 			int Length;
 			int Offset;
@@ -314,8 +384,6 @@ class PipeDescriptor: public EventableDescriptor
 
 	protected:
 		bool bReadAttemptedAfterClose;
-		time_t LastIo;
-		int InactivityTimeout;
 
 		deque<OutboundPage> OutboundPages;
 		int OutboundDataSize;
@@ -347,15 +415,28 @@ class KeyboardDescriptor: public EventableDescriptor
 
 	protected:
 		bool bReadAttemptedAfterClose;
-		time_t LastIo;
-		int InactivityTimeout;
 
 	private:
 		void _DispatchInboundData (const char *buffer, int size);
 };
 
 
+/***********************
+class InotifyDescriptor
+************************/
+
+class InotifyDescriptor: public EventableDescriptor
+{
+	public:
+		InotifyDescriptor (EventMachine_t*);
+		virtual ~InotifyDescriptor();
+
+		void Read();
+		void Write();
+
+		virtual void Heartbeat() {}
+		virtual bool SelectForRead() {return true;}
+		virtual bool SelectForWrite() {return false;}
+};
 
 #endif // __EventableDescriptor__H_
-
-

@@ -24,20 +24,18 @@ See the file COPYING for complete licensing information.
 class Bindable_t
 {
 	public:
-		static string CreateBinding();
-		static Bindable_t *GetObject (const string&);
-		static Bindable_t *GetObject (const char*);
-		static map<string, Bindable_t*> BindingBag;
+		static uintptr_t CreateBinding();
+		static Bindable_t *GetObject (const uintptr_t);
+		static map<uintptr_t, Bindable_t*> BindingBag;
 
 	public:
 		Bindable_t();
 		virtual ~Bindable_t();
 
-		const string &GetBinding() {return Binding;}
-		const char *GetBindingChars() {return Binding.c_str();}
+		const uintptr_t GetBinding() {return Binding;}
 
 	private:
-		string Binding;
+		uintptr_t Binding;
 };
 
 

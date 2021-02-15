@@ -33,7 +33,7 @@ class SslContext_t
 class SslContext_t
 {
 	public:
-		SslContext_t (bool is_server, const string &privkeyfile, const string &certchainfile);
+		SslContext_t (bool is_server, const string &privkeyfile, const string &certchainfile, const string &cipherlist, const string &ecdh_curve, const string &dhparam, int ssl_version);
 		virtual ~SslContext_t();
 
 	private:
@@ -54,10 +54,14 @@ class SslContext_t
 class SslBox_t
 **************/
 
+#define SSLBOX_INPUT_CHUNKSIZE 2019
+#define SSLBOX_OUTPUT_CHUNKSIZE 2048
+#define SSLBOX_WRITE_BUFFER_SIZE 8192 // (SSLBOX_OUTPUT_CHUNKSIZE * 4)
+
 class SslBox_t
 {
 	public:
-		SslBox_t (bool is_server, const string &privkeyfile, const string &certchainfile);
+		SslBox_t (bool is_server, const string &privkeyfile, const string &certchainfile, bool verify_peer, bool fail_if_no_peer_cert, const string &snihostname, const string &cipherlist, const string &ecdh_curve, const string &dhparam, int ssl_version, const uintptr_t binding);
 		virtual ~SslBox_t();
 
 		int PutPlaintext (const char*, int);
@@ -66,6 +70,13 @@ class SslBox_t
 		bool PutCiphertext (const char*, int);
 		bool CanGetCiphertext();
 		int GetCiphertext (char*, int);
+		bool IsHandshakeCompleted() {return bHandshakeCompleted;}
+
+		X509 *GetPeerCert();
+		int GetCipherBits();
+		const char *GetCipherName();
+		const char *GetCipherProtocol();
+		const char *GetSNIHostname();
 
 		void Shutdown();
 
@@ -73,12 +84,18 @@ class SslBox_t
 		SslContext_t *Context;
 
 		bool bIsServer;
+		bool bHandshakeCompleted;
+		bool bVerifyPeer;
+		bool bFailIfNoPeerCert;
 		SSL *pSSL;
 		BIO *pbioRead;
 		BIO *pbioWrite;
 
 		PageList OutboundQ;
 };
+
+extern "C" int ssl_verify_wrapper(int, X509_STORE_CTX*);
+
 #endif // WITH_SSL
 
 

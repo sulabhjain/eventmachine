@@ -1,238 +1,217 @@
-# $Id$
-#
-# Author:: Francis Cianfrocca (gmail: blackhedd)
-# Homepage::  http://rubyeventmachine.com
-# Date:: 8 April 2006
-# 
-# See EventMachine and EventMachine::Connection for documentation and
-# usage examples.
-#
-#----------------------------------------------------------------------------
-#
-# Copyright (C) 2006-07 by Francis Cianfrocca. All Rights Reserved.
-# Gmail: blackhedd
-# 
-# This program is free software; you can redistribute it and/or modify
-# it under the terms of either: 1) the GNU General Public License
-# as published by the Free Software Foundation; either version 2 of the
-# License, or (at your option) any later version; or 2) Ruby's License.
-# 
-# See the file COPYING for complete licensing information.
-#
-#---------------------------------------------------------------------------
-#
-#
-# 
-
-$:.unshift "../lib"
-require 'eventmachine'
-require 'socket'
-require 'test/unit'
+require 'em_test_helper'
+require 'tempfile'
 
 class TestSendFile < Test::Unit::TestCase
 
-	module TestModule
-		def post_init
-			send_file_data TestFilename
-			close_connection_after_writing
-		end
-	end
+  if EM.respond_to?(:send_file_data)
+    module TestModule
+      def initialize filename
+        @filename = filename
+      end
 
-	TestHost = "0.0.0.0"
-	TestPort = 9055
-	TestFilename = "./xxxxxx"
+      def post_init
+        send_file_data @filename
+        close_connection_after_writing
+      end
+    end
 
-	def setup
-	end
+    module TestClient
+      def data_to(&blk)
+        @data_to = blk
+      end
 
-	def teardown
-		File.unlink( TestFilename ) if File.exist?( TestFilename )
-	end
+      def receive_data(data)
+        @data_to.call(data) if @data_to
+      end
 
-	def test_send_file
-		File.open( TestFilename, "w" ) {|f|
-			f << ("A" * 5000)
-		}
+      def unbind
+        EM.stop
+      end
+    end
 
-		data = nil
+    def setup
+      @file = Tempfile.new("em_test_file")
+      @filename = @file.path
+      @port = next_port
+    end
 
-		EM.run {
-			EM.start_server TestHost, TestPort, TestModule
-			EM.add_timer(2) {EM.stop} # avoid hanging in case of error
-			EM.defer proc {
-				t = TCPSocket.new TestHost, TestPort
-				data = t.read
-			}, proc {
-				EM.stop
-			}
-		}
+    def test_send_file
+      File.open( @filename, "w" ) {|f|
+        f << ("A" * 5000)
+      }
 
-		assert_equal( "A" * 5000, data )
-		File.unlink TestFilename
-	end
+      data = ''
 
-	# EventMachine::Connection#send_file_data has a strict upper limit on the filesize it will work with.
-	def test_send_large_file
-		File.open( TestFilename, "w" ) {|f|
-			f << ("A" * 1000000)
-		}
+      EM.run {
+        EM.start_server "127.0.0.1", @port, TestModule, @filename
+        setup_timeout
 
-		data = nil
+        EM.connect "127.0.0.1", @port, TestClient do |c|
+          c.data_to { |d| data << d }
+        end
+      }
 
-		assert_raise(RuntimeError) {
-			EM.run {
-				EM.start_server TestHost, TestPort, TestModule
-				EM.add_timer(2) {EM.stop} # avoid hanging in case of error
-				EM.defer proc {
-					t = TCPSocket.new TestHost, TestPort
-					data = t.read
-				}, proc {
-					EM.stop
-				}
-			}
-		}
+      assert_equal( "A" * 5000, data )
+    end
 
-		File.unlink TestFilename
-	end
+    # EM::Connection#send_file_data has a strict upper limit on the filesize it will work with.
+    def test_send_large_file
+      File.open( @filename, "w" ) {|f|
+        f << ("A" * 1000000)
+      }
 
+      data = ''
 
-	module StreamTestModule
-		def post_init
-			EM::Deferrable.future( stream_file_data(TestFilename)) {
-				close_connection_after_writing
-			}
-		end
-	end
+      assert_raises(RuntimeError) {
+        EM.run {
+          EM.start_server "127.0.0.1", @port, TestModule, @filename
+          setup_timeout
+          EM.connect "127.0.0.1", @port, TestClient do |c|
+            c.data_to { |d| data << d }
+          end
+        }
+      }
+    end
 
-	module ChunkStreamTestModule
-		def post_init
-			EM::Deferrable.future( stream_file_data(TestFilename, :http_chunks=>true)) {
-				close_connection_after_writing
-			}
-		end
-	end
+    module StreamTestModule
+      def initialize filename
+        @filename = filename
+      end
 
-	def test_stream_file_data
-		File.open( TestFilename, "w" ) {|f|
-			f << ("A" * 1000)
-		}
+      def post_init
+        EM::Deferrable.future( stream_file_data(@filename)) {
+          close_connection_after_writing
+        }
+      end
+    end
 
-		data = nil
+    module ChunkStreamTestModule
+      def initialize filename
+        @filename = filename
+      end
 
-		EM.run {
-			EM.start_server TestHost, TestPort, StreamTestModule
-			EM.add_timer(2) {EM.stop} # avoid hanging in case of error
-			EM.defer proc {
-				t = TCPSocket.new TestHost, TestPort
-				data = t.read
-			}, proc {
-				EM.stop
-			}
-		}
+      def post_init
+        EM::Deferrable.future( stream_file_data(@filename, :http_chunks=>true)) {
+          close_connection_after_writing
+        }
+      end
+    end
 
-		assert_equal( "A" * 1000, data )
+    def test_stream_file_data
+      File.open( @filename, "w" ) {|f|
+        f << ("A" * 1000)
+      }
 
-		File.unlink TestFilename
-	end
+      data = ''
 
-	def test_stream_chunked_file_data
-		File.open( TestFilename, "w" ) {|f|
-			f << ("A" * 1000)
-		}
+      EM.run {
+        EM.start_server "127.0.0.1", @port, StreamTestModule, @filename
+        setup_timeout
+        EM.connect "127.0.0.1", @port, TestClient do |c|
+          c.data_to { |d| data << d }
+        end
+      }
 
-		data = nil
+      assert_equal( "A" * 1000, data )
+    end
 
-		EM.run {
-			EM.start_server TestHost, TestPort, ChunkStreamTestModule
-			EM.add_timer(2) {EM.stop} # avoid hanging in case of error
-			EM.defer proc {
-				t = TCPSocket.new TestHost, TestPort
-				data = t.read
-			}, proc {
-				EM.stop
-			}
-		}
+    def test_stream_chunked_file_data
+      File.open( @filename, "w" ) {|f|
+        f << ("A" * 1000)
+      }
 
-		assert_equal( "3e8\r\n#{"A" * 1000}\r\n0\r\n\r\n", data )
+      data = ''
 
-		File.unlink TestFilename
-	end
+      EM.run {
+        EM.start_server "127.0.0.1", @port, ChunkStreamTestModule, @filename
+        setup_timeout
+        EM.connect "127.0.0.1", @port, TestClient do |c|
+          c.data_to { |d| data << d }
+        end
+      }
 
-	module BadFileTestModule
-		def post_init
-			de = stream_file_data( TestFilename+"..." )
-			de.errback {|msg|
-				send_data msg
-				close_connection_after_writing
-			}
-		end
-	end
-	def test_stream_bad_file
-		data = nil
-		EM.run {
-			EM.start_server TestHost, TestPort, BadFileTestModule
-			EM.add_timer(2) {EM.stop} # avoid hanging in case of error
-			EM.defer proc {
-				t = TCPSocket.new TestHost, TestPort
-				data = t.read
-			}, proc {
-				EM.stop
-			}
-		}
+      assert_equal( "3e8\r\n#{"A" * 1000}\r\n0\r\n\r\n", data )
+    end
 
-		assert_equal( "file not found", data )
-	end
+    module BadFileTestModule
+      def initialize filename
+        @filename = filename
+      end
 
-	def test_stream_large_file_data
-		File.open( TestFilename, "w" ) {|f|
-			f << ("A" * 10000)
-		}
+      def post_init
+        de = stream_file_data( @filename+".wrong" )
+        de.errback {|msg|
+          send_data msg
+          close_connection_after_writing
+        }
+      end
+    end
+    def test_stream_bad_file
+      data = ''
+      EM.run {
+        EM.start_server "127.0.0.1", @port, BadFileTestModule, @filename
+        setup_timeout(5)
+        EM.connect "127.0.0.1", @port, TestClient do |c|
+          c.data_to { |d| data << d }
+        end
+      }
 
-		data = nil
+      assert_equal( "file not found", data )
+    end
+  else
+    warn "EM.send_file_data not implemented, skipping tests in #{__FILE__}"
 
-		EM.run {
-			EM.start_server TestHost, TestPort, StreamTestModule
-			EM.add_timer(2) {EM.stop} # avoid hanging in case of error
-			EM.defer proc {
-				t = TCPSocket.new TestHost, TestPort
-				data = t.read
-			}, proc {
-				EM.stop
-			}
-		}
+    # Because some rubies will complain if a TestCase class has no tests
+    def test_em_send_file_data_not_implemented
+      assert !EM.respond_to?(:send_file_data)
+    end
+  end
 
-		assert_equal( "A" * 10000, data )
+  begin
+    require 'fastfilereaderext'
 
-		File.unlink TestFilename
-	end
+    def test_stream_large_file_data
+      File.open( @filename, "w" ) {|f|
+        f << ("A" * 10000)
+      }
 
-	def test_stream_large_chunked_file_data
-		File.open( TestFilename, "w" ) {|f|
-			f << ("A" * 100000)
-		}
+      data = ''
 
-		data = nil
+      EM.run {
+        EM.start_server "127.0.0.1", @port, StreamTestModule, @filename
+        setup_timeout
+        EM.connect "127.0.0.1", @port, TestClient do |c|
+          c.data_to { |d| data << d }
+        end
+      }
 
-		EM.run {
-			EM.start_server TestHost, TestPort, ChunkStreamTestModule
-			EM.add_timer(2) {EM.stop} # avoid hanging in case of error
-			EM.defer proc {
-				t = TCPSocket.new TestHost, TestPort
-				data = t.read
-			}, proc {
-				EM.stop
-			}
-		}
+      assert_equal( "A" * 10000, data )
+    end
 
-		expected = [
-			"4000\r\n#{"A" * 16384}\r\n" * 6,
-			"6a0\r\n#{"A" * 0x6a0}\r\n",
-			"0\r\n\r\n"
-		].join
-		assert_equal( expected, data )
+    def test_stream_large_chunked_file_data
+      File.open( @filename, "w" ) {|f|
+        f << ("A" * 100000)
+      }
 
-		File.unlink TestFilename
-	end
+      data = ''
+
+      EM.run {
+        EM.start_server "127.0.0.1", @port, ChunkStreamTestModule, @filename
+        setup_timeout
+        EM.connect "127.0.0.1", @port, TestClient do |c|
+          c.data_to { |d| data << d }
+        end
+      }
+
+      expected = [
+        "4000\r\n#{"A" * 16384}\r\n" * 6,
+        "6a0\r\n#{"A" * 0x6a0}\r\n",
+        "0\r\n\r\n"
+      ].join
+      assert_equal( expected, data )
+    end
+  rescue LoadError
+    warn "require 'fastfilereaderext' failed, skipping tests in #{__FILE__}"
+  end
 
 end
-
